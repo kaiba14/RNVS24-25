@@ -1,0 +1,5 @@
+/home/kaiba4/Uni/RNVS24-25/praxis1/build/CMakeFiles/webserver.dir
+/home/kaiba4/Uni/RNVS24-25/praxis1/build/CMakeFiles/package.dir
+/home/kaiba4/Uni/RNVS24-25/praxis1/build/CMakeFiles/package_source.dir
+/home/kaiba4/Uni/RNVS24-25/praxis1/build/CMakeFiles/edit_cache.dir
+/home/kaiba4/Uni/RNVS24-25/praxis1/build/CMakeFiles/rebuild_cache.dir
