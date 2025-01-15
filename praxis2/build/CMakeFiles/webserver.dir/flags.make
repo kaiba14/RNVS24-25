@@ -4,7 +4,7 @@
 # compile C with /usr/bin/cc
 C_DEFINES = 
 
-C_INCLUDES = -I/home/kaiba4/Uni/RNVS24-25/praxis2/executable
+C_INCLUDES = 
 
 C_FLAGS = -g -std=gnu11 -Wall -Wextra -Wpedantic
 

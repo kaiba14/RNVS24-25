@@ -17,115 +17,165 @@
 #include "util.h"
 
 #define MAX_RESOURCES 100
+#define UDP_BUFFER 11
 
 struct tuple resources[MAX_RESOURCES] = {
     {"/static/foo", "Foo", sizeof "Foo" - 1},
     {"/static/bar", "Bar", sizeof "Bar" - 1},
     {"/static/baz", "Baz", sizeof "Baz" - 1}};
 
-struct peer {
+
+struct node {
+    char ip[INET_ADDRSTRLEN];
+    uint16_t port;
     uint16_t id;
-    char* ip;
-    int port;
 };
 
-struct dht_info {
-    struct peer self;
-    struct peer pred;
-    struct peer succ;
+
+struct is_responsible {
+    struct node resp;
+    uint16_t pred_id;
 };
 
-// Add function to get DHT info
-static struct dht_info get_dht_info(int argc, char **argv) {
-    struct dht_info info = {0};
-    
-    // Self info
-    info.self.ip = argv[1];
-    info.self.port = atoi(argv[2]);
-    info.self.id = (argc > 3) ? atoi(argv[3]) : 0;
+struct is_responsible dht_lookup_list[10] = {0};
+int dht_index = 0;
 
-    // Get predecessor info from env
-    char *pred_id = getenv("PRED_ID");
-    char *pred_ip = getenv("PRED_IP"); 
-    char *pred_port = getenv("PRED_PORT");
+
+struct dht {
+    struct node self;
+    struct node pred;
+    struct node succ;
+};
+
+static struct dht dht_info;
+
+struct sockaddr_in addr;
+struct sockaddr_in succ_addr;
+struct sockaddr_in pred_addr;
+
+bool is_responsible(uint16_t resource_hash, uint16_t self_id, uint16_t pred_id) {
+    if (pred_id < self_id) {
+        // Normaler Fall
+        return (resource_hash > pred_id && resource_hash <= self_id);
+    } else {
+        // Wrap-Around Fall
+        return (resource_hash > pred_id || resource_hash <= self_id);
+    }
+}
+
+void add_to_dht_lookup_list(struct node resp, uint16_t pred_id) {
+    dht_lookup_list[dht_index].resp = resp;
+    dht_lookup_list[dht_index].pred_id = pred_id;
+
+    dht_index = (dht_index + 1) % 10;
+}
+
+
+struct node *is_hash_found(uint16_t hash) {
+    for (int i = 0; i < dht_index; i++) {
+
+        if (is_responsible(hash, dht_lookup_list[i].resp.id, dht_lookup_list[i].pred_id)) {
+            return &dht_lookup_list[i].resp;
+        }
+    }
+    return NULL;
+}
+void remove_from_dht_lookup_list(uint16_t hash) {
+
+    for (int i = 0; i < dht_index; i++) {
+        if (is_responsible(hash, dht_lookup_list[i].resp.id, dht_lookup_list[i].pred_id)) {
+            for (int j = i; j < dht_index - 1; j++) {
+                dht_lookup_list[j] = dht_lookup_list[j + 1];
+            }
+            dht_lookup_list[dht_index - 1].resp.id = 0;
+            memset(dht_lookup_list[dht_index - 1].resp.ip, 0, INET_ADDRSTRLEN);
+            dht_lookup_list[dht_index - 1].resp.port = 0;
+            dht_lookup_list[dht_index - 1].pred_id = 0;
+            dht_index--;
+            return;
+        }
+    }
+}
+
+void handle_reply_message(const uint8_t *buffer) {
+    // 1. Nachricht parsen
+    uint16_t pred_id = (buffer[1] << 8) | buffer[2];
+    uint16_t resp_id = (buffer[3] << 8) | buffer[4]; // Verantwortlicher Node-ID aus Byte 3-4 (Network Byte Order)
+
+    struct in_addr resp_ip;
+    resp_ip.s_addr = *(uint32_t *)&buffer[5]; // IP-Adresse des Verantwortlichen (Byte 5-8)
+
+    uint16_t resp_port = (buffer[9] << 8) | buffer[10]; // Port des Verantwortlichen aus Byte 9-10 (Network Byte Order)
+
+    // 2. Erstelle die verantwortliche Node
+    struct node responsible_node = {
+        .id = resp_id,
+        .port = resp_port,
+    };
+    inet_ntop(AF_INET, &resp_ip, responsible_node.ip, INET_ADDRSTRLEN);
+
+    // 3. Füge den Eintrag in die dht_lookup_list hinzu
+    add_to_dht_lookup_list(responsible_node, pred_id);
+
+    // 4. Debug-Ausgabe
+    fprintf(stderr, "Reply processed: Responsible Node -> ID=%u, IP=%s, Port=%u; Pred ID=%u\n",
+            responsible_node.id, responsible_node.ip, responsible_node.port, pred_id);
+}
+
+
+struct dht init_dht(int argc, char **argv) {
+    struct dht info;
+    memset(&info, 0, sizeof(info)); // Initialisiere das Struct mit Nullen
+
+    // Self-Node
+    strncpy(info.self.ip, argv[1], INET_ADDRSTRLEN - 1);
+    info.self.port = (uint16_t)atoi(argv[2]);
+    info.self.id = (argc > 3) ? (uint16_t)atoi(argv[3]) : 0;
+
+    // Vorgänger (Predecessor)
+    const char *pred_id = getenv("PRED_ID");
+    const char *pred_ip = getenv("PRED_IP");
+    const char *pred_port = getenv("PRED_PORT");
     if (pred_id && pred_ip && pred_port) {
-        info.pred.id = atoi(pred_id);
-        info.pred.ip = pred_ip;
-        info.pred.port = atoi(pred_port);
+        strncpy(info.pred.ip, pred_ip, INET_ADDRSTRLEN - 1);
+        info.pred.port = (uint16_t)atoi(pred_port);
+        info.pred.id = (uint16_t)atoi(pred_id);
+    } else {
+        // Keine Vorgänger-Informationen verfügbar
+        strncpy(info.pred.ip, "0.0.0.0", INET_ADDRSTRLEN - 1);
+        info.pred.port = 0;
+        info.pred.id = 0;
     }
 
-    // Get successor info from env
-    char *succ_id = getenv("SUCC_ID");
-    char *succ_ip = getenv("SUCC_IP");
-    char *succ_port = getenv("SUCC_PORT");
+    // Nachfolger (Successor)
+    const char *succ_id = getenv("SUCC_ID");
+    const char *succ_ip = getenv("SUCC_IP");
+    const char *succ_port = getenv("SUCC_PORT");
     if (succ_id && succ_ip && succ_port) {
-        info.succ.id = atoi(succ_id);
-        info.succ.ip = succ_ip;
-        info.succ.port = atoi(succ_port);
+        strncpy(info.succ.ip, succ_ip, INET_ADDRSTRLEN - 1);
+        info.succ.port = (uint16_t)atoi(succ_port);
+        info.succ.id = (uint16_t)atoi(succ_id);
+    } else {
+        // Keine Nachfolger-Informationen verfügbar
+        strncpy(info.succ.ip, "0.0.0.0", INET_ADDRSTRLEN - 1);
+        info.succ.port = 0;
+        info.succ.id = 0;
     }
 
     return info;
 }
 
-// Add function to check responsibility
-static bool is_responsible(uint16_t resource_hash, const struct dht_info *dht) {
-    if (dht->pred.id < dht->self.id) {
-        return resource_hash > dht->pred.id && resource_hash <= dht->self.id;
-    } else {
-        // Handle wrap-around case
-        return resource_hash > dht->pred.id || resource_hash <= dht->self.id;
-    }
-}
 
-// Add these new functions:
 
-// Function to determine if we can decide responsibility
-static bool can_decide_responsibility(uint16_t resource_hash, const struct dht_info *dht) {
-    // In a 2-node DHT, we can only decide if the resource is our responsibility
-    // For others, we need to do a lookup
-    return is_responsible(resource_hash, dht);
-}
+void send_redirect(int conn, const char *uri, const char *resp_ip, uint16_t resp_port) {
+    char response[HTTP_MAX_SIZE];
+    int len = snprintf(response, sizeof(response),
+                       "HTTP/1.1 303 See Other\r\n"
+                       "Location: http://%s:%u%s\r\n"
+                       "Content-Length: 0\r\n\r\n",
+                       resp_ip, resp_port, uri);
 
-// Function to send lookup message to successor
-static void send_lookup(int udp_socket, uint16_t resource_hash, const struct dht_info *dht) {
-    // Message format: !BHH4sH (11 bytes total)
-    // B: message type (1 byte)
-    // H: hash ID (2 bytes)
-    // H: node ID (2 bytes)
-    // 4s: IPv4 address (4 bytes)
-    // H: port (2 bytes)
-    unsigned char message[11];
-    memset(message, 0, sizeof(message));
-    
-    // Message Type: 0 (Lookup)
-    message[0] = 0;
-    
-    // Hash ID (network byte order)
-    uint16_t hash_net = htons(resource_hash);
-    memcpy(message + 1, &hash_net, sizeof(hash_net));
-    
-    // Node ID (network byte order)
-    uint16_t node_id_net = htons(dht->self.id);
-    memcpy(message + 3, &node_id_net, sizeof(node_id_net));
-    
-    // IP address (4 bytes)
-    struct in_addr addr;
-    inet_pton(AF_INET, dht->self.ip, &addr);
-    memcpy(message + 5, &addr.s_addr, sizeof(addr.s_addr));
-    
-    // Port (network byte order)
-    uint16_t port_net = htons(dht->self.port);
-    memcpy(message + 9, &port_net, sizeof(port_net));
-
-    // Send to successor
-    struct sockaddr_in dest;
-    memset(&dest, 0, sizeof(dest));
-    dest.sin_family = AF_INET;
-    dest.sin_port = htons(dht->succ.port);
-    inet_pton(AF_INET, dht->succ.ip, &dest.sin_addr);
-
-    sendto(udp_socket, message, sizeof(message), 0, 
-           (struct sockaddr*)&dest, sizeof(dest));
+    send(conn, response, len, 0);
 }
 
 /**
@@ -135,49 +185,10 @@ static void send_lookup(int udp_socket, uint16_t resource_hash, const struct dht
  * @param request   A pointer to the struct containing the parsed request
  * information.
  */
-void send_reply(int conn, struct request *request, const struct dht_info *dht) {
-    char buffer[HTTP_MAX_SIZE];
-    
-    // Calculate hash of request path
-    uint16_t path_hash = pseudo_hash((const unsigned char*)request->uri, strlen(request->uri));
-    
-    // Check if we can determine responsibility
-    if (!can_decide_responsibility(path_hash, dht)) {
-        // Send 503 response
-        const char *unavailable = 
-            "HTTP/1.1 503 Service Unavailable\r\n"
-            "Retry-After: 1\r\n"
-            "Content-Length: 0\r\n"
-            "\r\n";
-        write(conn, unavailable, strlen(unavailable));
-
-        // Send lookup to successor
-        int udp_socket = socket(AF_INET, SOCK_DGRAM, 0);
-        if (udp_socket != -1) {
-            send_lookup(udp_socket, path_hash, dht);
-            close(udp_socket);
-        }
-        return;
-    }
-
-    // Check if this node is responsible
-    if (!is_responsible(path_hash, dht)) {
-        // Redirect to successor if not responsible
-        int len = snprintf(buffer, sizeof(buffer),
-            "HTTP/1.1 303 See Other\r\n"
-            "Location: http://%s:%d%s\r\n"
-            "Content-Length: 0\r\n"
-            "\r\n",
-            dht->succ.ip, dht->succ.port, request->uri);
-        
-        write(conn, buffer, len);
-        return;
-    }
-
-    // Original response logic for when we are responsible...
-    // Rest of existing send_reply code
+void send_reply(int conn, struct request *request) {
 
     // Create a buffer to hold the HTTP reply
+    char buffer[HTTP_MAX_SIZE];
     char *reply = buffer;
     size_t offset = 0;
 
@@ -243,14 +254,71 @@ void send_reply(int conn, struct request *request, const struct dht_info *dht) {
  * malformed or an error occurs during processing, the return value is -1.
  *
  */
-size_t process_packet(int conn, char *buffer, size_t n, const struct dht_info *dht) {
+ssize_t process_packet(int conn, char *buffer, size_t n, int udp_socket) {
     struct request request = {
         .method = NULL, .uri = NULL, .payload = NULL, .payload_length = -1};
     ssize_t bytes_processed = parse_request(buffer, n, &request);
 
     if (bytes_processed > 0) {
-        send_reply(conn, &request, dht);
 
+        uint16_t path_hash = pseudo_hash((unsigned char *)request.uri, strlen(request.uri));
+
+        struct node *responsible_node = is_hash_found(path_hash);
+        if (responsible_node) {
+            // Sende Redirect an die gefundene Node
+            send_redirect(conn, request.uri, responsible_node->ip, responsible_node->port);
+
+
+            remove_from_dht_lookup_list(path_hash);
+
+            return bytes_processed;
+        }
+
+
+        if (is_responsible(path_hash, dht_info.self.id, dht_info.pred.id)) {
+
+            send_reply(conn, &request);
+        } else if (dht_info.succ.id == dht_info.pred.id) {
+
+            send_redirect(conn, request.uri, dht_info.succ.ip, dht_info.succ.port);
+        } else {
+
+            const char *service_unavailable =
+                "HTTP/1.1 503 Service Unavailable\r\n"
+                "Retry-After: 1\r\n"
+                "Content-Length: 0\r\n\r\n";
+            send(conn, service_unavailable, strlen(service_unavailable), 0);
+            
+            // Sende Lookup-Nachricht an den Nachfolger
+            unsigned char lookup_msg[UDP_BUFFER];
+            memset(lookup_msg, 0, sizeof(lookup_msg));
+
+
+            lookup_msg[0] = 0;
+
+            uint16_t hash_nbo = htons(path_hash);
+            memcpy(&lookup_msg[1], &hash_nbo, sizeof(hash_nbo));
+
+
+            uint16_t id_nbo = htons(dht_info.self.id);
+            memcpy(&lookup_msg[3], &id_nbo, sizeof(id_nbo));
+
+
+            struct in_addr ip_addr;
+            inet_pton(AF_INET, dht_info.self.ip, &ip_addr);
+            memcpy(&lookup_msg[5], &ip_addr, sizeof(ip_addr));
+
+
+            uint16_t port_nbo = htons(dht_info.self.port);
+            memcpy(&lookup_msg[9], &port_nbo, sizeof(port_nbo));
+
+            ssize_t sent = sendto(udp_socket, lookup_msg, sizeof(lookup_msg), 0,
+                                  (struct sockaddr *)&succ_addr, sizeof(succ_addr));
+            if (sent == -1) {
+                perror("sendto");
+
+            }
+        }   
         // Check the "Connection" header in the request to determine if the
         // connection should be kept alive or closed.
         const string connection_header = get_header(&request, "Connection");
@@ -270,6 +338,117 @@ size_t process_packet(int conn, char *buffer, size_t n, const struct dht_info *d
     return bytes_processed;
 }
 
+
+/**
+ * Derives a sockaddr_in structure from the provided host and port information.
+ *
+ * @param host The host (IP address or hostname) to be resolved into a network
+ * address.
+ * @param port The port number to be converted into network byte order.
+ *
+ * @return A sockaddr_in structure representing the network address derived from
+ * the host and port.
+ */
+struct sockaddr_in derive_sockaddr(const char *host, const char *port) {
+    struct addrinfo hints = {
+        .ai_family = AF_INET,
+    };
+    struct addrinfo *result_info;
+
+    // Resolve the host (IP address or hostname) into a list of possible
+    // addresses.
+    int returncode = getaddrinfo(host, port, &hints, &result_info);
+    if (returncode) {
+        fprintf(stderr, "Error parsing host/port");
+        exit(EXIT_FAILURE);
+    }
+
+    // Copy the sockaddr_in structure from the first address in the list
+    struct sockaddr_in result = *((struct sockaddr_in *)result_info->ai_addr);
+
+    // Free the allocated memory for the result_info
+    freeaddrinfo(result_info);
+    return result;
+}
+
+
+void handle_lookup_message(const uint8_t *buffer, int udp_socket) {
+    // 1. Nachricht parsen
+    uint16_t hash_id = (buffer[1] << 8) | buffer[2]; // Hash-ID aus Byte 1-2 (Network Byte Order)
+
+    struct in_addr sender_ip;
+    sender_ip.s_addr = *(uint32_t *)&buffer[5]; // IP-Adresse des Senders (Byte 5-8, bereits in Network Byte Order)
+
+    uint16_t sender_port = (buffer[9] << 8) | buffer[10]; // Port des Senders aus Byte 9-10 (Network Byte Order)
+
+    // Initialisiere die Adresse des Senders
+    char sender_ip_str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &sender_ip, sender_ip_str, sizeof(sender_ip_str));
+    // Konvertiere den Port in einen String
+    char sender_port_str[6]; // Platz für maximal 5 Ziffern + '\0'
+    snprintf(sender_port_str, sizeof(sender_port_str), "%u", sender_port);
+
+    // Erstelle die sockaddr_in-Struktur des Senders
+    struct sockaddr_in sender_addr = derive_sockaddr(sender_ip_str, sender_port_str);
+
+    // 2. Prüfen der Zuständigkeit
+    if (is_responsible(hash_id, dht_info.self.id, dht_info.pred.id)) {
+        // Aktuelle Node ist zuständig -> Reply senden
+        uint8_t reply_msg[UDP_BUFFER] = {0};
+
+        reply_msg[0] = 1; // Typ: Reply
+        uint16_t pred_id_nbo = htons(dht_info.pred.id); // ID des Vorgängers
+        memcpy(&reply_msg[1], &pred_id_nbo, sizeof(pred_id_nbo));
+
+        uint16_t self_id_nbo = htons(dht_info.self.id);
+        memcpy(&reply_msg[3], &self_id_nbo, sizeof(self_id_nbo));
+
+        struct in_addr self_ip;
+        inet_pton(AF_INET, dht_info.self.ip, &self_ip);
+        memcpy(&reply_msg[5], &self_ip, sizeof(self_ip));
+
+        uint16_t self_port_nbo = htons(dht_info.self.port);
+        memcpy(&reply_msg[9], &self_port_nbo, sizeof(self_port_nbo));
+
+        // Sende die Reply-Nachricht an den Sender
+        if (sendto(udp_socket, reply_msg, sizeof(reply_msg), 0,
+                   (struct sockaddr *)&sender_addr, sizeof(sender_addr)) == -1) {
+            perror("sendto (Reply - self responsible)");
+        }
+    } else if (is_responsible(hash_id, dht_info.succ.id, dht_info.self.id)) {
+        // Nachfolger ist zuständig -> Reply mit Nachfolgerinformationen senden
+        uint8_t reply_msg[UDP_BUFFER] = {0};
+
+        reply_msg[0] = 1; // Typ: Reply
+        uint16_t self_id_nbo = htons(dht_info.self.id); // ID der aktuellen Node
+        memcpy(&reply_msg[1], &self_id_nbo, sizeof(self_id_nbo));
+
+        uint16_t succ_id_nbo = htons(dht_info.succ.id);
+        memcpy(&reply_msg[3], &succ_id_nbo, sizeof(succ_id_nbo));
+
+        struct in_addr succ_ip;
+        inet_pton(AF_INET, dht_info.succ.ip, &succ_ip);
+        memcpy(&reply_msg[5], &succ_ip, sizeof(succ_ip));
+
+        uint16_t succ_port_nbo = htons(dht_info.succ.port);
+        memcpy(&reply_msg[9], &succ_port_nbo, sizeof(succ_port_nbo));
+
+        // Sende die Reply-Nachricht an den Sender
+        if (sendto(udp_socket, reply_msg, sizeof(reply_msg), 0,
+                   (struct sockaddr *)&sender_addr, sizeof(sender_addr)) == -1) {
+            perror("sendto (Reply - successor responsible)");
+        }
+    } else {
+        // Weder die aktuelle Node noch der Nachfolger ist zuständig -> Weiterleiten
+        if (sendto(udp_socket, buffer, UDP_BUFFER, 0,
+                   (struct sockaddr *)&succ_addr, sizeof(succ_addr)) == -1) {
+            perror("sendto (Forward lookup)");
+        }
+    }
+}
+
+
+
 /**
  * Sets up the connection state for a new socket connection.
  *
@@ -277,7 +456,7 @@ size_t process_packet(int conn, char *buffer, size_t n, const struct dht_info *d
  * @param sock The socket descriptor representing the new connection.
  *
  */
-static void connection_setup(struct connection_state *state, int sock) {
+void connection_setup(struct connection_state *state, int sock) {
     // Set the socket descriptor for the new connection in the connection_state
     // structure.
     state->sock = sock;
@@ -317,7 +496,7 @@ char *buffer_discard(char *buffer, size_t discard, size_t keep) {
  * false otherwise. If an error occurs while receiving data from the socket, the
  * function exits the program.
  */
-bool handle_connection(struct connection_state *state, const struct dht_info *dht) {
+bool handle_connection(struct connection_state *state, int udp_socket) {
     // Calculate the pointer to the end of the buffer to avoid buffer overflow
     const char *buffer_end = state->buffer + HTTP_MAX_SIZE;
 
@@ -337,7 +516,7 @@ bool handle_connection(struct connection_state *state, const struct dht_info *dh
 
     ssize_t bytes_processed = 0;
     while ((bytes_processed = process_packet(state->sock, window_start,
-                                             window_end - window_start, dht)) > 0) {
+                                             window_end - window_start, udp_socket)) > 0) {
         window_start += bytes_processed;
     }
     if (bytes_processed == -1) {
@@ -349,37 +528,7 @@ bool handle_connection(struct connection_state *state, const struct dht_info *dh
     return true;
 }
 
-/**
- * Derives a sockaddr_in structure from the provided host and port information.
- *
- * @param host The host (IP address or hostname) to be resolved into a network
- * address.
- * @param port The port number to be converted into network byte order.
- *
- * @return A sockaddr_in structure representing the network address derived from
- * the host and port.
- */
-static struct sockaddr_in derive_sockaddr(const char *host, const char *port) {
-    struct addrinfo hints = {
-        .ai_family = AF_INET,
-    };
-    struct addrinfo *result_info;
 
-    // Resolve the host (IP address or hostname) into a list of possible
-    // addresses.
-    int returncode = getaddrinfo(host, port, &hints, &result_info);
-    if (returncode) {
-        fprintf(stderr, "Error parsing host/port");
-        exit(EXIT_FAILURE);
-    }
-
-    // Copy the sockaddr_in structure from the first address in the list
-    struct sockaddr_in result = *((struct sockaddr_in *)result_info->ai_addr);
-
-    // Free the allocated memory for the result_info
-    freeaddrinfo(result_info);
-    return result;
-}
 
 /**
  * Sets up a TCP server socket and binds it to the provided sockaddr_in address.
@@ -389,7 +538,7 @@ static struct sockaddr_in derive_sockaddr(const char *host, const char *port) {
  *
  * @return The file descriptor of the created TCP server socket.
  */
-static int setup_server_socket(struct sockaddr_in addr) {
+int setup_tcp_socket(struct sockaddr_in addr) {
     const int enable = 1;
     const int backlog = 1;
 
@@ -431,41 +580,37 @@ static int setup_server_socket(struct sockaddr_in addr) {
     return sock;
 }
 
+
 /**
- * Sets up a UDP socket for DHT communication
+ * Erstellt und bindet einen UDP-Socket an die gegebene Adresse.
+ *
+ * @param addr Der sockaddr_in-Struktur, die die Adresse und den Port enthält.
+ * @return Der File-Deskriptor des erstellten UDP-Sockets.
  */
 int setup_udp_socket(struct sockaddr_in addr) {
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock == -1) {
-        perror("socket (UDP)");
+    // Erstelle einen UDP-Socket
+    int udp_socket = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_socket == -1) {
+        perror("socket(UDP)");
         exit(EXIT_FAILURE);
     }
 
-    // Set socket to non-blocking mode
-    int flags = fcntl(sock, F_GETFL, 0);
-    if (flags == -1) {
-        perror("fcntl");
-        exit(EXIT_FAILURE);
-    }
-    if (fcntl(sock, F_SETFL, flags | O_NONBLOCK) == -1) {
-        perror("fcntl");
-        exit(EXIT_FAILURE);
-    }
-
-    // Allow address reuse
+    // Setze SO_REUSEADDR, um die Wiederverwendung der Adresse zu erlauben
     int enable = 1;
-    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable)) == -1) {
-        perror("setsockopt");
+    if (setsockopt(udp_socket, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable)) == -1) {
+        perror("setsockopt(UDP)");
+        close(udp_socket);
         exit(EXIT_FAILURE);
     }
 
-    // Bind to same address as TCP socket
-    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
-        perror("bind (UDP)");
+    // Binde den UDP-Socket an die gegebene Adresse und den Port
+    if (bind(udp_socket, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+        perror("bind(UDP)");
+        close(udp_socket);
         exit(EXIT_FAILURE);
     }
 
-    return sock;
+    return udp_socket; // Rückgabe des gültigen UDP-Socket-Deskriptors
 }
 
 /**
@@ -476,71 +621,106 @@ int setup_udp_socket(struct sockaddr_in addr) {
  *  ./build/webserver self.ip self.port
  */
 int main(int argc, char **argv) {
-    if (argc < 3) {
+    if (argc < 3 || argc > 4) {
+        fprintf(stderr, "Usage: %s <IP> <Port> [NodeID]\n", argv[0]);
         return EXIT_FAILURE;
     }
 
-    // Get DHT info including predecessor and successor
-    struct dht_info dht = get_dht_info(argc, argv);
+    // Initialize DHT info
+    dht_info = init_dht(argc, argv);
 
-    struct sockaddr_in addr = derive_sockaddr(argv[1], argv[2]);
+    // Debug output for DHT info
+    printf("Self Node: IP=%s, Port=%u, ID=%u\n",
+           dht_info.self.ip, dht_info.self.port, dht_info.self.id);
+    printf("Predecessor: IP=%s, Port=%u, ID=%u\n",
+           dht_info.pred.ip, dht_info.pred.port, dht_info.pred.id);
+    printf("Successor: IP=%s, Port=%u, ID=%u\n",
+           dht_info.succ.ip, dht_info.succ.port, dht_info.succ.id);
 
-    // Set up TCP server socket
-    int server_socket = setup_server_socket(addr);
-    
-    // Set up UDP socket
+    addr = derive_sockaddr(dht_info.self.ip, argv[2]);
+
+    char succ_port_str[6];
+    snprintf(succ_port_str, sizeof(succ_port_str), "%u", dht_info.succ.port);
+    succ_addr = derive_sockaddr(dht_info.succ.ip, succ_port_str);
+
+    char pred_port_str[6];
+    snprintf(pred_port_str, sizeof(pred_port_str), "%u", dht_info.pred.port);
+    pred_addr = derive_sockaddr(dht_info.pred.ip, pred_port_str);
+
+    int tcp_socket = setup_tcp_socket(addr);
     int udp_socket = setup_udp_socket(addr);
 
-    // Update pollfd array to include both sockets
-    struct pollfd sockets[2] = {
-        {.fd = server_socket, .events = POLLIN},
+    // Array for monitoring sockets with poll
+    struct pollfd sockets[3] = {
+        {.fd = tcp_socket, .events = POLLIN},
+        {.fd = -1, .events = 0},
         {.fd = udp_socket, .events = POLLIN}
     };
 
+    // Connection state for TCP connections
     struct connection_state state = {0};
-    while (true) {
 
-        // Use poll() to wait for events on the monitored sockets.
+    while (true) {
+        // Wait for events on sockets
         int ready = poll(sockets, sizeof(sockets) / sizeof(sockets[0]), -1);
         if (ready == -1) {
             perror("poll");
             exit(EXIT_FAILURE);
         }
 
-        // Process events on the monitored sockets.
-        for (size_t i = 0; i < sizeof(sockets) / sizeof(sockets[0]); i += 1) {
-            if (sockets[i].revents != POLLIN) {
-                // If there are no POLLIN events on the socket, continue to the
-                // next iteration.
-                continue;
-            }
+        for (size_t i = 0; i < sizeof(sockets) / sizeof(sockets[0]); i++) {
+            if (!(sockets[i].revents & POLLIN)) continue;
+
             int s = sockets[i].fd;
 
-            if (s == server_socket) {
-
-                // If the event is on the server_socket, accept a new connection
-                // from a client.
-                int connection = accept(server_socket, NULL, NULL);
-                if (connection == -1 && errno != EAGAIN &&
-                    errno != EWOULDBLOCK) {
-                    close(server_socket);
+            // Handle TCP listener socket
+            if (s == tcp_socket) {
+                int connection = accept(tcp_socket, NULL, NULL);
+                if (connection == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
                     perror("accept");
+                    close(tcp_socket);
                     exit(EXIT_FAILURE);
                 } else {
                     connection_setup(&state, connection);
 
-                    // limit to one connection at a time
                     sockets[0].events = 0;
                     sockets[1].fd = connection;
                     sockets[1].events = POLLIN;
                 }
-            } else {
-                assert(s == state.sock);
+            }
+            // Handle UDP socket
+            else if (s == udp_socket) {
+                uint8_t buffer[UDP_BUFFER];
+                struct sockaddr_in client_addr;
+                socklen_t client_len = sizeof(client_addr);
 
-                // Call the 'handle_connection' function to process the incoming
-                // data on the socket.
-                bool cont = handle_connection(&state, &dht);
-                if (!cont) { // get ready for a new connection
+                ssize_t bytes_received = recvfrom(udp_socket, buffer, sizeof(buffer), 0,
+                                                (struct sockaddr *)&client_addr, &client_len);
+                if (bytes_received > 0) {
+                    fprintf(stderr, "Received UDP packet from %s:%d\n",
+                            inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+
+                    // Prüfe den ersten Byte der Nachricht (Message-Type)
+                    uint8_t message_type = buffer[0];
+                    if (message_type == 0) {
+                        // Handle Lookup-Message
+                        handle_lookup_message(buffer, udp_socket);
+                    } else if (message_type == 1) {
+                        handle_reply_message(buffer);
+                    } else {
+                        fprintf(stderr, "Unknown message type: %u\n", message_type);
+                    }
+                } else if (bytes_received == -1) {
+                    perror("recvfrom");
+                }
+            }
+            // Handle active TCP connection
+            else if (s == state.sock) {
+                bool cont = handle_connection(&state, udp_socket);
+                if (!cont) {
+                    close(state.sock);
+
+                    // Re-enable TCP listener in poll array
                     sockets[0].events = POLLIN;
                     sockets[1].fd = -1;
                     sockets[1].events = 0;

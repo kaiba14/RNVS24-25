@@ -140,8 +140,6 @@ webserver: CMakeFiles/webserver.dir/http.c.o
 webserver: CMakeFiles/webserver.dir/util.c.o
 webserver: CMakeFiles/webserver.dir/data.c.o
 webserver: CMakeFiles/webserver.dir/build.make
-webserver: /usr/lib/x86_64-linux-gnu/libssl.so
-webserver: /usr/lib/x86_64-linux-gnu/libcrypto.so
 webserver: CMakeFiles/webserver.dir/link.txt
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/home/kaiba4/Uni/RNVS24-25/praxis2/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_5) "Linking C executable webserver"
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/webserver.dir/link.txt --verbose=$(VERBOSE)
