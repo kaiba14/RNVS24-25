@@ -1,0 +1,6 @@
+/home/kaiba4/Uni/RNVS24-25/praxis3/build/CMakeFiles/zmq_distributor.dir
+/home/kaiba4/Uni/RNVS24-25/praxis3/build/CMakeFiles/zmq_worker.dir
+/home/kaiba4/Uni/RNVS24-25/praxis3/build/CMakeFiles/package.dir
+/home/kaiba4/Uni/RNVS24-25/praxis3/build/CMakeFiles/package_source.dir
+/home/kaiba4/Uni/RNVS24-25/praxis3/build/CMakeFiles/edit_cache.dir
+/home/kaiba4/Uni/RNVS24-25/praxis3/build/CMakeFiles/rebuild_cache.dir

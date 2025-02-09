@@ -1,0 +1,1 @@
+/usr/bin/cc -g CMakeFiles/zmq_distributor.dir/zmq_distributor.c.o CMakeFiles/zmq_distributor.dir/ds_utils.c.o -o zmq_distributor  -lzmq -lpthread 
